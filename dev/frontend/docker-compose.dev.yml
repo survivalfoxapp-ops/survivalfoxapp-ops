@@ -1,0 +1,16 @@
+services:
+  survivalfox-frontend-dev:
+    env_file:
+      - /root/survivalfox/dev/env/frontend.env
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_SUPABASE_URL: ${NEXT_PUBLIC_SUPABASE_URL}
+        NEXT_PUBLIC_SUPABASE_ANON_KEY: ${NEXT_PUBLIC_SUPABASE_ANON_KEY}
+    container_name: survivalfox-frontend-dev
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3100:3000"
+    environment:
+      - NODE_ENV=production

@@ -1,0 +1,14 @@
+# secrets / env
+*.env
+**/env/*.env
+**/env/*.local
+
+# node
+node_modules/
+.next/
+
+# logs
+*.log
+
+# misc
+.DS_Store
