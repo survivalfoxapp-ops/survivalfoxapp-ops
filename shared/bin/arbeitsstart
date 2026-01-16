@@ -36,6 +36,7 @@ fi
 # --- Script location --------------------------------------
 SCRIPT_PATH="$(readlink -f "$0")"
 SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+# (SCRIPT_DIR currently unused, but kept for debugging/future use)
 
 # --- Configuration ----------------------------------------
 DEV_DIR="/root/survivalfox/dev/supabase"
@@ -62,15 +63,38 @@ test -d "$DEV_DIR"
 test -f "$COMPOSE_FILE"
 test -f "$ENV_FILE"
 
+echo
+echo "[1b/7] Preflight: DEV DB data sanity (pg_control)"
+PG_DATA_DIR="/root/survivalfox/dev/supabase/volumes/db/data"
+PG_CONTROL="${PG_DATA_DIR}/global/pg_control"
+
+if [[ -d "$PG_DATA_DIR" ]]; then
+  if [[ ! -f "$PG_CONTROL" ]]; then
+    echo "ERROR: DEV DB data looks broken (missing pg_control): $PG_CONTROL" >&2
+    echo "HINT: DEV reset (moves data aside + re-init) example:" >&2
+    echo "  mv $PG_DATA_DIR ${PG_DATA_DIR}.BROKEN_$(date +%Y%m%d_%H%M%S)" >&2
+    echo "  mkdir -p $PG_DATA_DIR && chmod 700 $PG_DATA_DIR" >&2
+    exit 1
+  else
+    echo "OK: pg_control present"
+  fi
+else
+  echo "INFO: no bind-mounted db/data directory found (maybe named volume) – skip"
+fi
+
+echo
 echo "[2/7] Compose config validation"
 compose config >/dev/null
 
+echo
 echo "[3/7] DEV stack up"
 compose up -d
 
+echo
 echo "[4/7] Container overview"
 compose ps || true
 
+echo
 echo "[5/7] Health checks"
 CORE_SERVICES=(db kong supavisor analytics vector)
 
@@ -81,14 +105,23 @@ for svc in "${CORE_SERVICES[@]}"; do
     continue
   fi
 
+  last_status="unknown"
   for i in {1..18}; do
     status="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$cid" 2>/dev/null || echo unknown)"
+    last_status="$status"
     echo "  - $svc: $status"
     [[ "$status" == "healthy" || "$status" == "none" ]] && break
     sleep 5
   done
+
+  if [[ "$last_status" == "unhealthy" ]]; then
+    echo "ERROR: $svc stayed unhealthy. Last logs:" >&2
+    docker logs --tail 80 "$cid" 2>&1 || true
+    exit 1
+  fi
 done
 
+echo
 echo "[6/7] Port binding check (DEV must be loopback-only)"
 ss -tulpn | grep -E "127\.0\.0\.1:${DEV_PORTS_REGEX}" >/dev/null 2>&1 || \
   echo "WARN: expected DEV ports not all listening on 127.0.0.1"
@@ -105,6 +138,7 @@ if ss -tulpn | grep -E "\[::\]:${DEV_PORTS_REGEX}" >/dev/null 2>&1; then
   exit 1
 fi
 
+echo
 echo "[7/7] Notes"
 echo "INFO: Kong 401 without auth is expected."
 echo

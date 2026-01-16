@@ -90,10 +90,7 @@ echo "[6/6] GitHub (optional – Copy & Paste)"
 echo
 cat <<'GITHELP'
 # --- Git commit & push (optional) ---
-cd /root/survivalfox
-git add -A
-git commit -m "WORKLOG: <kurze Beschreibung des heutigen Arbeitstags>"
-git push
+cd /root/survivalfox && git add -A && read -rp "Kurzbeschreibung: " MSG && git commit -m "WORKLOG: $MSG" && git push
 # -----------------------------------
 GITHELP
 
