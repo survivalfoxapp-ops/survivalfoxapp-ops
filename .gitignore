@@ -12,3 +12,17 @@ node_modules/
 
 # misc
 .DS_Store
+
+# --- supabase runtime volumes (NEVER commit) ---
+**/supabase/volumes/**
+**/supabase/**/volumes/**
+**/supabase/volumes/db/data/**
+**/supabase/volumes/storage/**
+
+# backups/logs
+/root/backups/
+/var/log/survivalfox-backup*.log
+
+# supabase runtime volumes (never commit)
+**/supabase/volumes/db/data/**
+**/supabase/volumes/storage/**
