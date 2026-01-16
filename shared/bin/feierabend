@@ -1,78 +1,101 @@
 #!/usr/bin/env bash
 set -euo pipefail
+trap 'echo "ERROR: failed at line $LINENO: $BASH_COMMAND" >&2' ERR
 
-# --- Guards ------------------------------------------------------------
-command -v docker >/dev/null 2>&1 || { echo "ERROR: docker not found"; exit 1; }
+# ==========================================================
+# feierabend – DEV Supabase Stack
+# - fährt DEV sauber runter
+# - prüft: keine DEV-Ports mehr
+# - PROD bleibt unangetastet
+# - zeigt GitHub Copy&Paste Hilfe
+# ==========================================================
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || {
+    echo "ERROR: missing command: $1" >&2
+    exit 1
+  }
+}
+
+# --- Guards ------------------------------------------------
 [ -n "${BASH_VERSION:-}" ] || { echo "ERROR: not running in bash"; exit 1; }
+require_cmd docker
+require_cmd ss
+require_cmd readlink
+require_cmd hostname
+require_cmd id
+require_cmd flock
 
-# --- Script location ---------------------------------------------------
+# --- Single-run lock --------------------------------------
+LOCK_FILE="/var/lock/survivalfox-dev.lock"
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+  echo "ERROR: another dev start/stop is running (lock busy)" >&2
+  exit 1
+fi
+
+# --- Script location --------------------------------------
 SCRIPT_PATH="$(readlink -f "$0")"
 SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
 
-# --- Configuration -----------------------------------------------------
+# --- Configuration ----------------------------------------
 DEV_DIR="/root/survivalfox/dev/supabase"
 ENV_FILE="/root/survivalfox/dev/env/supabase.env"
 PROJECT="supabase-dev"
-COMPOSE_FILE="$DEV_DIR/docker-compose.dev.yml"
+COMPOSE_FILE="${DEV_DIR}/docker-compose.dev.yml"
 
 REPO_DIR="/root/survivalfox"
+DEV_PORTS_REGEX='(8100|8444|4100|5433|6544)\b'
 
-# --- Debug/Preflight ---------------------------------------------------
-preflight() {
-  echo "== Preflight / Debug =="
-  echo "Time       : $(date -Is)"
-  echo "User       : $(id -un) (uid=$(id -u))"
-  echo "Host       : $(hostname -f 2>/dev/null || hostname)"
-  echo "PWD        : $PWD"
-  echo "Script argv: $0"
-  echo "Script path: $SCRIPT_PATH"
-  echo "Script dir : $SCRIPT_DIR"
-  echo "DEV dir    : $DEV_DIR"
-  echo "Compose    : $COMPOSE_FILE"
-  echo "Env file   : $ENV_FILE"
-  echo "Repo dir   : $REPO_DIR"
-  echo "Docker     : $(docker --version 2>/dev/null || echo 'unknown')"
-  echo "Compose    : $(docker compose version 2>/dev/null | head -n 1 || echo 'unknown')"
-  if [ "$(id -u)" -ne 0 ]; then
-    echo "WARN: not running as root; Docker/ss checks may fail depending on permissions"
-  fi
-  echo "======================="
-  echo
+compose() {
+  docker compose -p "$PROJECT" -f "$COMPOSE_FILE" --env-file "$ENV_FILE" "$@"
 }
 
-preflight
-
-# --- Start -------------------------------------------------------------
+# --- Preflight --------------------------------------------
 echo "== Feierabend: DEV Supabase =="
-
+echo "Time : $(date -Is)"
+echo "User : $(id -un) (uid=$(id -u))"
+echo "Host : $(hostname -f 2>/dev/null || hostname)"
 echo
+
 echo "[1/6] Optional git status"
 if command -v git >/dev/null 2>&1 && [ -d "$REPO_DIR/.git" ]; then
   ( cd "$REPO_DIR" && git status --short ) || echo "WARN: git status failed"
 else
-  echo "INFO: git not available or repo missing (skip)"
+  echo "INFO: git repo not present (skip)"
 fi
 
-echo
 echo "[2/6] DEV stack down"
-docker compose -p "$PROJECT" -f "$COMPOSE_FILE" --env-file "$ENV_FILE" down
+compose down
 
-echo
 echo "[3/6] Verify DEV containers stopped"
 docker ps \
   --filter "label=com.docker.compose.project=$PROJECT" \
   --format "table {{.Names}}\t{{.Status}}"
 
-echo
 echo "[4/6] Verify DEV ports are gone"
-ss -tulpn | grep -E '127\.0\.0\.1:(8100|8444|4100|5433|6544)\b' && \
-  echo "WARN: DEV ports still listening" || true
+if ss -tulpn | grep -E "127\.0\.0\.1:${DEV_PORTS_REGEX}" >/dev/null 2>&1; then
+  echo "WARN: some DEV ports still listening"
+  ss -tulpn | grep -E "127\.0\.0\.1:${DEV_PORTS_REGEX}" || true
+else
+  echo "OK: no DEV ports listening"
+fi
 
-echo
 echo "[5/6] Safety check: PROD untouched"
 docker ps \
   --filter "label=com.docker.compose.project=supabase" \
-  --format "table {{.Names}}\t{{.Status}}" | head -n 8
+  --format "table {{.Names}}\t{{.Status}}" | head -n 10
+
+echo "[6/6] GitHub (optional – Copy & Paste)"
+echo
+cat <<'GITHELP'
+# --- Git commit & push (optional) ---
+cd /root/survivalfox
+git add -A
+git commit -m "WORKLOG: <kurze Beschreibung des heutigen Arbeitstags>"
+git push
+# -----------------------------------
+GITHELP
 
 echo
 echo "== Feierabend abgeschlossen =="

@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+set -euo pipefail
+trap 'echo "ERROR: failed at line $LINENO: $BASH_COMMAND" >&2' ERR
+
+require_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "ERROR: missing command: $1" >&2; exit 1; }; }
+
+# --- Guards
+[ -n "${BASH_VERSION:-}" ] || { echo "ERROR: not running in bash"; exit 1; }
+require_cmd docker
+require_cmd ss
+require_cmd readlink
+require_cmd hostname
+require_cmd id
+require_cmd flock
+
+# --- Single-run lock (prevents concurrent start/stop)
+LOCK_FILE="/var/lock/survivalfox-dev.lock"
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+  echo "ERROR: another dev start/stop is running (lock busy: $LOCK_FILE)" >&2
+  exit 1
+fi
+
+# --- Script location (cwd-independent)
+SCRIPT_PATH="$(readlink -f "$0")"
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+
+# --- Configuration
+DEV_DIR="/root/survivalfox/dev/supabase"
+ENV_FILE="/root/survivalfox/dev/env/supabase.env"
+PROJECT="supabase-dev"
+COMPOSE_FILE="${DEV_DIR}/docker-compose.dev.yml"
+
+REPO_DIR="/root/survivalfox"
+
+# Ports expected to be loopback-only (DEV infra)
+DEV_PORTS_REGEX='(8100|8444|4100|5433|6544)\b'
+# If you ALSO want to enforce a dev-frontend port (e.g. 3100), extend:
+# DEV_PORTS_REGEX='(8100|8444|4100|5433|6544|3100)\b'
+
+compose() {
+  docker compose -p "$PROJECT" -f "$COMPOSE_FILE" --env-file "$ENV_FILE" "$@"
+}
+
+preflight() {
+  echo "== Preflight / Debug =="
+  echo "Time       : $(date -Is)"
+  echo "User       : $(id -un) (uid=$(id -u))"
+  echo "Host       : $(hostname -f 2>/dev/null || hostname)"
+  echo "PWD        : $PWD"
+  echo "Script argv: $0"
+  echo "Script path: $SCRIPT_PATH"
+  echo "Script dir : $SCRIPT_DIR"
+  echo "DEV dir    : $DEV_DIR"
+  echo "Compose    : $COMPOSE_FILE"
+  echo "Env file   : $ENV_FILE"
+  echo "Repo dir   : $REPO_DIR"
+  echo "Docker     : $(docker --version 2>/dev/null || echo 'unknown')"
+  echo "Compose    : $(docker compose version 2>/dev/null | head -n 1 || echo 'unknown')"
+  if [ "$(id -u)" -ne 0 ]; then
+    echo "WARN: not running as root; docker/ss may fail depending on permissions"
+  fi
+  echo "======================="
+  echo
+}
+
+preflight
+
+echo "== Feierabend: DEV Supabase =="
+
+echo
+echo "[1/8] Optional git status (ops repo)"
+if command -v git >/dev/null 2>&1 && [ -d "$REPO_DIR/.git" ]; then
+  ( cd "$REPO_DIR" && git status --short ) || echo "WARN: git status failed"
+else
+  echo "INFO: git not available or repo missing (skip)"
+fi
+
+echo
+echo "[2/8] DEV stack down"
+compose down
+
+echo
+echo "[3/8] Verify DEV containers stopped (hard check)"
+if docker ps --filter "label=com.docker.compose.project=$PROJECT" --format '{{.Names}}' | grep -q .; then
+  echo "ERROR: DEV containers still running:" >&2
+  docker ps --filter "label=com.docker.compose.project=$PROJECT" --format "table {{.Names}}\t{{.Status}}" >&2
+  exit 1
+fi
+echo "OK: no DEV containers running"
+
+echo
+echo "[4/8] Verify DEV ports are gone"
+if ss -tulpn | grep -E "(\[::1\]|127\.0\.0\.1):${DEV_PORTS_REGEX}" >/dev/null 2>&1; then
+  echo "WARN: DEV ports still listening on loopback:" >&2
+  ss -tulpn | grep -E "(\[::1\]|127\.0\.0\.1):${DEV_PORTS_REGEX}" || true
+else
+  echo "OK: DEV ports not listening on loopback"
+fi
+
+if ss -tulpn | grep -E "0\.0\.0\.0:${DEV_PORTS_REGEX}" >/dev/null 2>&1; then
+  echo "ERROR: DEV ports publicly bound (IPv4 0.0.0.0) even after down" >&2
+  ss -tulpn | grep -E "0\.0\.0\.0:${DEV_PORTS_REGEX}" || true
+  exit 1
+fi
+
+if ss -tulpn | grep -E "\[::\]:${DEV_PORTS_REGEX}" >/dev/null 2>&1; then
+  echo "ERROR: DEV ports publicly bound (IPv6 [::]) even after down" >&2
+  ss -tulpn | grep -E "\[::\]:${DEV_PORTS_REGEX}" || true
+  exit 1
+fi
+
+echo
+echo "[5/8] Safety check: PROD untouched (supabase project)"
+docker ps \
+  --filter "label=com.docker.compose.project=supabase" \
+  --format "table {{.Names}}\t{{.Status}}" | head -n 12
+
+echo
+echo "[6/8] Optional: show last backup log lines"
+if [ -f /var/log/survivalfox-backup.log ]; then
+  tail -n 12 /var/log/survivalfox-backup.log || true
+else
+  echo "INFO: /var/log/survivalfox-backup.log not found (skip)"
+fi
+
+echo
+echo "[7/8] GITHUB (optional): save today's working state"
+echo "Copy & Paste (adjust message):"
+echo "  cd $REPO_DIR"
+echo "  git add -A"
+echo "  git commit -m \"WIP: <kurze Beschreibung des Arbeitstags>\""
+echo "  git push"
+
+echo
+echo "[8/8] Done"
+echo "== Feierabend abgeschlossen =="

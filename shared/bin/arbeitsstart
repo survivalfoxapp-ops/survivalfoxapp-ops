@@ -1,103 +1,111 @@
 #!/usr/bin/env bash
 set -euo pipefail
+trap 'echo "ERROR: failed at line $LINENO: $BASH_COMMAND" >&2' ERR
 
-# --- Guards ------------------------------------------------------------
-command -v docker >/dev/null 2>&1 || { echo "ERROR: docker not found"; exit 1; }
+# ==========================================================
+# arbeitsstart – DEV Supabase Stack
+# - cwd-unabhängig
+# - nur DEV
+# - prüft Ports / Health
+# ==========================================================
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || {
+    echo "ERROR: missing command: $1" >&2
+    exit 1
+  }
+}
+
+# --- Guards ------------------------------------------------
 [ -n "${BASH_VERSION:-}" ] || { echo "ERROR: not running in bash"; exit 1; }
+require_cmd docker
+require_cmd ss
+require_cmd readlink
+require_cmd hostname
+require_cmd id
+require_cmd flock
 
-# --- Script location (cwd-independent) ---------------------------------
+# --- Single-run lock --------------------------------------
+LOCK_FILE="/var/lock/survivalfox-dev.lock"
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+  echo "ERROR: another dev start/stop is running (lock busy)" >&2
+  exit 1
+fi
+
+# --- Script location --------------------------------------
 SCRIPT_PATH="$(readlink -f "$0")"
 SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
 
-# --- Configuration -----------------------------------------------------
+# --- Configuration ----------------------------------------
 DEV_DIR="/root/survivalfox/dev/supabase"
 ENV_FILE="/root/survivalfox/dev/env/supabase.env"
 PROJECT="supabase-dev"
-COMPOSE_FILE="$DEV_DIR/docker-compose.dev.yml"
+COMPOSE_FILE="${DEV_DIR}/docker-compose.dev.yml"
 
-# --- Debug/Preflight ---------------------------------------------------
-preflight() {
-  echo "== Preflight / Debug =="
-  echo "Time       : $(date -Is)"
-  echo "User       : $(id -un) (uid=$(id -u))"
-  echo "Host       : $(hostname -f 2>/dev/null || hostname)"
-  echo "PWD        : $PWD"
-  echo "Script argv: $0"
-  echo "Script path: $SCRIPT_PATH"
-  echo "Script dir : $SCRIPT_DIR"
-  echo "DEV dir    : $DEV_DIR"
-  echo "Compose    : $COMPOSE_FILE"
-  echo "Env file   : $ENV_FILE"
-  echo "Docker     : $(docker --version 2>/dev/null || echo 'unknown')"
-  echo "Compose    : $(docker compose version 2>/dev/null | head -n 1 || echo 'unknown')"
-  if [ "$(id -u)" -ne 0 ]; then
-    echo "WARN: not running as root; Docker/ss checks may fail depending on permissions"
-  fi
-  echo "======================="
-  echo
+DEV_PORTS_REGEX='(8100|8444|4100|5433|6544)\b'
+
+compose() {
+  docker compose -p "$PROJECT" -f "$COMPOSE_FILE" --env-file "$ENV_FILE" "$@"
 }
 
-preflight
-
-# --- Start -------------------------------------------------------------
+# --- Preflight --------------------------------------------
 echo "== Arbeitsstart: DEV Supabase =="
-
+echo "Time : $(date -Is)"
+echo "User : $(id -un) (uid=$(id -u))"
+echo "Host : $(hostname -f 2>/dev/null || hostname)"
+echo "PWD  : $PWD"
 echo
+
 echo "[1/7] Preflight: required files"
 test -d "$DEV_DIR"
 test -f "$COMPOSE_FILE"
 test -f "$ENV_FILE"
 
-echo
-echo "[2/7] Compose config check"
-docker compose -p "$PROJECT" -f "$COMPOSE_FILE" --env-file "$ENV_FILE" config >/dev/null
+echo "[2/7] Compose config validation"
+compose config >/dev/null
 
-echo
 echo "[3/7] DEV stack up"
-docker compose -p "$PROJECT" -f "$COMPOSE_FILE" --env-file "$ENV_FILE" up -d
+compose up -d
 
-echo
-echo "[4/7] Wait for containers to register healthchecks"
-sleep 5
+echo "[4/7] Container overview"
+compose ps || true
 
-echo
-echo "[5/7] Wait for core services to be healthy"
-for cname in \
-  supabase-dev-db-1 \
-  supabase-dev-vector-1 \
-  supabase-dev-kong-1 \
-  supabase-dev-analytics-1 \
-  supabase-dev-supavisor-1
-do
-  if ! docker inspect "$cname" >/dev/null 2>&1; then
-    echo "  - $cname: not present (skip)"
+echo "[5/7] Health checks"
+CORE_SERVICES=(db kong supavisor analytics vector)
+
+for svc in "${CORE_SERVICES[@]}"; do
+  cid="$(compose ps -q "$svc" 2>/dev/null || true)"
+  if [[ -z "${cid:-}" ]]; then
+    echo "  - $svc: not present (skip)"
     continue
   fi
 
   for i in {1..18}; do
-    status="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$cname")"
-    echo "  - $cname: $status"
+    status="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$cid" 2>/dev/null || echo unknown)"
+    echo "  - $svc: $status"
     [[ "$status" == "healthy" || "$status" == "none" ]] && break
     sleep 5
   done
 done
 
-echo
-echo "[6/7] DEV containers status"
-docker ps \
-  --filter "label=com.docker.compose.project=$PROJECT" \
-  --format "table {{.Names}}\t{{.Status}}"
+echo "[6/7] Port binding check (DEV must be loopback-only)"
+ss -tulpn | grep -E "127\.0\.0\.1:${DEV_PORTS_REGEX}" >/dev/null 2>&1 || \
+  echo "WARN: expected DEV ports not all listening on 127.0.0.1"
 
-echo
-echo "[7/7] DEV localhost port check"
-ss -tulpn | grep -E '127\.0\.0\.1:(8100|8444|4100|5433|6544)\b' || \
-  echo "WARN: expected DEV ports not all listening"
+if ss -tulpn | grep -E "0\.0\.0\.0:${DEV_PORTS_REGEX}" >/dev/null 2>&1; then
+  echo "ERROR: DEV ports publicly bound (IPv4)" >&2
+  ss -tulpn | grep -E "0\.0\.0\.0:${DEV_PORTS_REGEX}" || true
+  exit 1
+fi
 
-ss -tulpn | grep -E '0\.0\.0\.0:(8100|8444|4100|5433|6544)\b' && \
-  { echo "ERROR: DEV ports publicly bound (IPv4)"; exit 1; } || true
+if ss -tulpn | grep -E "\[::\]:${DEV_PORTS_REGEX}" >/dev/null 2>&1; then
+  echo "ERROR: DEV ports publicly bound (IPv6)" >&2
+  ss -tulpn | grep -E "\[::\]:${DEV_PORTS_REGEX}" || true
+  exit 1
+fi
 
-ss -tulpn | grep -E '\[::\]:(8100|8444|4100|5433|6544)\b' && \
-  { echo "ERROR: DEV ports publicly bound (IPv6)"; exit 1; } || true
-
+echo "[7/7] Notes"
+echo "INFO: Kong 401 without auth is expected."
 echo
 echo "== Arbeitsstart abgeschlossen =="

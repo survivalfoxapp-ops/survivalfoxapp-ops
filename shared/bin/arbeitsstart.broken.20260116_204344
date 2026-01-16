@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+set -euo pipefail
+trap 'echo "ERROR: failed at line $LINENO: $BASH_COMMAND" >&2' ERR
+
+require_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "ERROR: missing command: $1" >&2; exit 1; }; }
+
+# --- Guards
+[ -n "${BASH_VERSION:-}" ] || { echo "ERROR: not running in bash"; exit 1; }
+require_cmd docker
+require_cmd ss
+require_cmd readlink
+require_cmd hostname
+require_cmd id
+require_cmd flock
+
+# --- Single-run lock (prevents concurrent start/stop)
+LOCK_FILE="/var/lock/survivalfox-dev.lock"
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+  echo "ERROR: another dev start/stop is running (lock busy: $LOCK_FILE)" >&2
+  exit 1
+fi
+
+# --- Script location (cwd-independent)
+SCRIPT_PATH="$(readlink -f "$0")"
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+
+# --- Configuration
+DEV_DIR="/root/survivalfox/dev/supabase"
+ENV_FILE="/root/survivalfox/dev/env/supabase.env"
+PROJECT="supabase-dev"
+COMPOSE_FILE="${DEV_DIR}/docker-compose.dev.yml"
+
+# Ports expected to be loopback-only (DEV infra)
+DEV_PORTS_REGEX='(8100|8444|4100|5433|6544)\b'
+# If you ALSO want to enforce a dev-frontend port (e.g. 3100), extend:
+# DEV_PORTS_REGEX='(8100|8444|4100|5433|6544|3100)\b'
+
+compose() {
+  docker compose -p "$PROJECT" -f "$COMPOSE_FILE" --env-file "$ENV_FILE" "$@"
+}
+
+preflight() {
+  echo "== Preflight / Debug =="
+  echo "Time       : $(date -Is)"
+  echo "User       : $(id -un) (uid=$(id -u))"
+  echo "Host       : $(hostname -f 2>/dev/null || hostname)"
+  echo "PWD        : $PWD"
+  echo "Script argv: $0"
+  echo "Script path: $SCRIPT_PATH"
+  echo "Script dir : $SCRIPT_DIR"
+  echo "DEV dir    : $DEV_DIR"
+  echo "Compose    : $COMPOSE_FILE"
+  echo "Env file   : $ENV_FILE"
+  echo "Docker     : $(docker --version 2>/dev/null || echo 'unknown')"
+  echo "Compose    : $(docker compose version 2>/dev/null | head -n 1 || echo 'unknown')"
+  if [ "$(id -u)" -ne 0 ]; then
+    echo "WARN: not running as root; docker/ss may fail depending on permissions"
+  fi
+  echo "======================="
+  echo
+}
+
+preflight
+
+echo "== Arbeitsstart: DEV Supabase =="
+
+echo
+echo "[1/8] Preflight: required files"
+test -d "$DEV_DIR"
+test -f "$COMPOSE_FILE"
+test -f "$ENV_FILE"
+
+echo
+echo "[2/8] Compose config check"
+compose config >/dev/null
+
+echo
+echo "[3/8] DEV stack up"
+compose up -d
+
+echo
+echo "[4/8] DEV containers status (compose ps)"
+compose ps || true
+
+echo
+echo "[5/8] Wait for core services to be healthy (timeout ~90s/service)"
+CORE_SERVICES=(db kong supavisor analytics vector)
+
+for svc in "${CORE_SERVICES[@]}"; do
+  cid="$(compose ps -q "$svc" 2>/dev/null || true)"
+  if [[ -z "${cid:-}" ]]; then
+    echo "  - service=$svc: not present (skip)"
+    continue
+  fi
+
+  for i in {1..18}; do
+    status="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$cid" 2>/dev/null || echo "unknown")"
+    echo "  - service=$svc: $status"
+    if [[ "$status" == "healthy" ]]; then
+      break
+    fi
+    if [[ "$status" == "none" ]]; then
+      echo "    INFO: service=$svc has no healthcheck; treating as OK"
+      break
+    fi
+    if [[ "$status" == "unhealthy" && "$i" -eq 18 ]]; then
+      echo "ERROR: service=$svc is unhealthy after timeout" >&2
+      exit 1
+    fi
+    sleep 5
+  done
+done
+
+echo
+echo "[6/8] DEV containers (docker ps by project label)"
+docker ps \
+  --filter "label=com.docker.compose.project=$PROJECT" \
+  --format "table {{.Names}}\t{{.Status}}"
+
+echo
+echo "[7/8] DEV localhost port check (must be loopback-only)"
+ss -tulpn | grep -E "(\[::1\]|127\.0\.0\.1):${DEV_PORTS_REGEX}" >/dev/null 2>&1 || \
+  echo "WARN: expected DEV ports not all listening on loopback (may be OK if services disabled)"
+
+if ss -tulpn | grep -E "0\.0\.0\.0:${DEV_PORTS_REGEX}" >/dev/null 2>&1; then
+  echo "ERROR: DEV ports publicly bound (IPv4 0.0.0.0)" >&2
+  ss -tulpn | grep -E "0\.0\.0\.0:${DEV_PORTS_REGEX}" || true
+  exit 1
+fi
+
+if ss -tulpn | grep -E "\[::\]:${DEV_PORTS_REGEX}" >/dev/null 2>&1; then
+  echo "ERROR: DEV ports publicly bound (IPv6 [::])" >&2
+  ss -tulpn | grep -E "\[::\]:${DEV_PORTS_REGEX}" || true
+  exit 1
+fi
+
+echo
+echo "[8/8] Reminder"
+echo "INFO: Kong 401 without auth can be normal (service is up)."
+echo "INFO: DEV services must stay loopback-only; public access only via Caddy reverse_proxy."
+
+echo
+echo "== Arbeitsstart abgeschlossen =="
