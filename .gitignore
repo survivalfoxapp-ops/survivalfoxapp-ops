@@ -26,3 +26,7 @@ node_modules/
 # supabase runtime volumes (never commit)
 **/supabase/volumes/db/data/**
 **/supabase/volumes/storage/**
+
+# never commit supabase runtime state
+**/supabase/volumes/db/data/**
+**/supabase/volumes/storage/**
